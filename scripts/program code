@@ -1,1 +1,556 @@
+"""
+Vapor-Liquid Equilibrium (VLE) Flash Calculator
+Performs flash calculations to determine vapor fraction and compositions
+for a mixture at given temperature and pressure.
 
+Author: Chemical Engineering Python Project
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import fsolve, root
+from scipy.constants import R
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+import warnings
+
+# Suppress warnings for better readability
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class Component:
+    """Class to store component properties"""
+    name: str
+    Antoine_A: float  # Antoine equation constant A (log10(P) = A - B/(T+C))
+    Antoine_B: float  # Antoine equation constant B
+    Antoine_C: float  # Antoine equation constant C
+    
+    def vapor_pressure(self, T: float) -> float:
+        """
+        Calculate vapor pressure using Antoine equation
+        T in Kelvin, returns pressure in bar
+        """
+        # Convert Kelvin to Celsius for Antoine equation
+        T_C = T - 273.15
+        # Antoine equation: log10(P) = A - B/(T+C)
+        log10_P = self.Antoine_A - self.Antoine_B / (T_C + self.Antoine_C)
+        # Return pressure in bar
+        return 10 ** log10_P
+
+
+class IdealFlashCalculator:
+    """
+    Flash calculator using Raoult's law for ideal mixtures
+    Assumes ideal vapor and liquid phases
+    """
+    
+    def __init__(self, components: List[Component], z: List[float], T: float, P: float):
+        """
+        Initialize flash calculator
+        
+        Parameters:
+        -----------
+        components : List[Component]
+            List of component objects
+        z : List[float]
+            Overall mole fractions (must sum to 1)
+        T : float
+            Temperature in Kelvin
+        P : float
+            Pressure in bar
+        """
+        self.components = components
+        self.z = np.array(z)
+        self.T = T
+        self.P = P
+        self.n_components = len(components)
+        
+        # Validate inputs
+        assert abs(sum(z) - 1.0) < 1e-6, "Mole fractions must sum to 1"
+        
+        # Calculate vapor pressures
+        self.P_sat = np.array([comp.vapor_pressure(T) for comp in components])
+        
+        # Calculate K-values (equilibrium ratios)
+        self.K = self.P_sat / self.P
+    
+    def rachford_rice(self, V: float) -> float:
+        """
+        Rachford-Rice objective function for flash calculation
+        V is vapor fraction (moles vapor / total moles)
+        """
+        return np.sum(self.z * (self.K - 1) / (1 + V * (self.K - 1)))
+    
+    def rachford_rice_derivative(self, V: float) -> float:
+        """Derivative of Rachford-Rice function for Newton-Raphson method"""
+        return -np.sum(self.z * (self.K - 1)**2 / (1 + V * (self.K - 1))**2)
+    
+    def solve_vapor_fraction(self) -> float:
+        """
+        Solve for vapor fraction using Newton-Raphson method
+        Returns vapor fraction V
+        """
+        # Check if mixture is completely liquid or vapor
+        if np.sum(self.z * self.K) <= 1:
+            return 0.0  # Below bubble point - all liquid
+        if np.sum(self.z / self.K) <= 1:
+            return 1.0  # Above dew point - all vapor
+        
+        # Initial guess
+        V = 0.5
+        
+        # Newton-Raphson iteration
+        max_iter = 100
+        tol = 1e-8
+        
+        for i in range(max_iter):
+            f = self.rachford_rice(V)
+            f_prime = self.rachford_rice_derivative(V)
+            
+            if abs(f_prime) < 1e-12:
+                break
+                
+            delta_V = -f / f_prime
+            V_new = V + delta_V
+            
+            # Bound V between 0 and 1
+            V_new = max(0.001, min(0.999, V_new))
+            
+            if abs(V_new - V) < tol:
+                return V_new
+            
+            V = V_new
+        
+        return V
+    
+    def calculate_compositions(self, V: float) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Calculate liquid and vapor compositions
+        
+        Returns:
+        --------
+        x : np.ndarray
+            Liquid mole fractions
+        y : np.ndarray
+            Vapor mole fractions
+        """
+        if V == 0:
+            # All liquid
+            x = self.z
+            y = self.K * x
+        elif V == 1:
+            # All vapor
+            y = self.z
+            x = y / self.K
+        else:
+            # Two-phase region
+            x = self.z / (1 + V * (self.K - 1))
+            y = self.K * x
+        
+        return x, y
+    
+    def check_convergence(self, x: np.ndarray, y: np.ndarray) -> dict:
+        """
+        Check if solution satisfies equilibrium conditions
+        """
+        results = {
+            'sum_x': np.sum(x),
+            'sum_y': np.sum(y),
+            'material_balance': np.max(np.abs(self.z - (V * y + (1 - V) * x))),
+            'equilibrium_error': np.max(np.abs(y - self.K * x))
+        }
+        return results
+    
+    def perform_flash(self) -> dict:
+        """
+        Perform complete flash calculation
+        
+        Returns:
+        --------
+        dict : Results containing all flash calculation outputs
+        """
+        # Solve for vapor fraction
+        self.V = self.solve_vapor_fraction()
+        
+        # Calculate compositions
+        self.x, self.y = self.calculate_compositions(self.V)
+        
+        # Check convergence
+        convergence = self.check_convergence(self.x, self.y)
+        
+        # Prepare results
+        results = {
+            'temperature_K': self.T,
+            'temperature_C': self.T - 273.15,
+            'pressure_bar': self.P,
+            'vapor_fraction': self.V,
+            'liquid_fraction': 1 - self.V,
+            'component_names': [comp.name for comp in self.components],
+            'overall_z': self.z,
+            'liquid_x': self.x,
+            'vapor_y': self.y,
+            'K_values': self.K,
+            'convergence': convergence,
+            'phase_condition': self.determine_phase_condition()
+        }
+        
+        return results
+    
+    def determine_phase_condition(self) -> str:
+        """Determine phase condition based on K-values"""
+        sum_Kz = np.sum(self.z * self.K)
+        sum_zK = np.sum(self.z / self.K)
+        
+        if sum_Kz <= 1:
+            return "Subcooled Liquid"
+        elif sum_zK <= 1:
+            return "Superheated Vapor"
+        else:
+            return "Two-Phase"
+
+
+class BinaryMixtureAnalyzer:
+    """
+    Specialized analyzer for binary mixtures to generate Txy and Pxy diagrams
+    """
+    
+    def __init__(self, component1: Component, component2: Component):
+        self.comp1 = component1
+        self.comp2 = component2
+        self.components = [component1, component2]
+    
+    def generate_txy_diagram(self, P: float, n_points: int = 100) -> pd.DataFrame:
+        """
+        Generate Txy diagram data at constant pressure
+        
+        Parameters:
+        -----------
+        P : float
+            Pressure in bar
+        n_points : int
+            Number of points to generate
+            
+        Returns:
+        --------
+        pd.DataFrame : Txy diagram data
+        """
+        data = []
+        
+        for x1 in np.linspace(0, 1, n_points):
+            x = np.array([x1, 1 - x1])
+            
+            # Binary mixture boiling point calculation
+            def temperature_objective(T):
+                P_sat1 = self.comp1.vapor_pressure(T)
+                P_sat2 = self.comp2.vapor_pressure(T)
+                return x1 * P_sat1 + (1 - x1) * P_sat2 - P
+            
+            # Find boiling temperature
+            T_guess = 300  # Initial guess in Kelvin
+            T_solution = fsolve(temperature_objective, T_guess)[0]
+            
+            if T_solution > 0:
+                # Calculate vapor composition
+                P_sat1 = self.comp1.vapor_pressure(T_solution)
+                y1 = x1 * P_sat1 / P
+                
+                data.append({
+                    'x1': x1,
+                    'y1': y1,
+                    'temperature_K': T_solution,
+                    'temperature_C': T_solution - 273.15
+                })
+        
+        return pd.DataFrame(data)
+    
+    def plot_txy_diagram(self, P: float, save_path: Optional[str] = None):
+        """Plot Txy diagram for binary mixture"""
+        df = self.generate_txy_diagram(P)
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        ax.plot(df['x1'], df['temperature_C'], 'b-', linewidth=2, label='Bubble Point')
+        ax.plot(df['y1'], df['temperature_C'], 'r--', linewidth=2, label='Dew Point')
+        
+        ax.set_xlabel(f'Mole Fraction of {self.comp1.name}', fontsize=12)
+        ax.set_ylabel('Temperature (°C)', fontsize=12)
+        ax.set_title(f'Txy Diagram at P = {P} bar', fontsize=14)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+
+
+def create_example_mixtures():
+    """Create example mixtures with Antoine constants"""
+    
+    # Antoine constants (P in bar, T in °C)
+    # log10(P) = A - B/(T+C)
+    
+    # Methanol
+    methanol = Component(
+        name="Methanol",
+        Antoine_A=5.20409,
+        Antoine_B=1581.341,
+        Antoine_C=-33.50
+    )
+    
+    # Ethanol
+    ethanol = Component(
+        name="Ethanol",
+        Antoine_A=5.24622,
+        Antoine_B=1598.673,
+        Antoine_C=-46.424
+    )
+    
+    # Water
+    water = Component(
+        name="Water",
+        Antoine_A=5.11564,
+        Antoine_B=1687.537,
+        Antoine_C=-42.98
+    )
+    
+    # Benzene
+    benzene = Component(
+        name="Benzene",
+        Antoine_A=4.60362,
+        Antoine_B=1701.073,
+        Antoine_C=-20.79
+    )
+    
+    # Toluene
+    toluene = Component(
+        name="Toluene",
+        Antoine_A=4.39248,
+        Antoine_B=1468.473,
+        Antoine_C=-55.09
+    )
+    
+    return {
+        'methanol_ethanol': [methanol, ethanol],
+        'benzene_toluene': [benzene, toluene],
+        'methanol_water': [methanol, water]
+    }
+
+
+def run_example_calculations():
+    """Run several example flash calculations"""
+    
+    mixtures = create_example_mixtures()
+    examples = [
+        {
+            'name': 'Methanol-Ethanol Mixture (Ideal)',
+            'components': mixtures['methanol_ethanol'],
+            'z': [0.3, 0.7],
+            'T': 340,  # 67°C
+            'P': 1.0   # 1 bar
+        },
+        {
+            'name': 'Benzene-Toluene Mixture (Ideal)',
+            'components': mixtures['benzene_toluene'],
+            'z': [0.5, 0.5],
+            'T': 380,  # 107°C
+            'P': 1.0   # 1 bar
+        },
+        {
+            'name': 'Methanol-Water Mixture (Non-ideal)',
+            'components': mixtures['methanol_water'],
+            'z': [0.4, 0.6],
+            'T': 350,  # 77°C
+            'P': 1.0   # 1 bar
+        }
+    ]
+    
+    all_results = []
+    
+    for example in examples:
+        print("\n" + "="*60)
+        print(f"Example: {example['name']}")
+        print("="*60)
+        
+        # Create flash calculator
+        flash = IdealFlashCalculator(
+            components=example['components'],
+            z=example['z'],
+            T=example['T'],
+            P=example['P']
+        )
+        
+        # Perform calculation
+        results = flash.perform_flash()
+        all_results.append(results)
+        
+        # Print results
+        print(f"\nConditions:")
+        print(f"  Temperature: {results['temperature_C']:.2f}°C ({results['temperature_K']:.2f} K)")
+        print(f"  Pressure: {results['pressure_bar']:.3f} bar")
+        print(f"\nPhase Condition: {results['phase_condition']}")
+        
+        if results['phase_condition'] == "Two-Phase":
+            print(f"\nVapor Fraction: {results['vapor_fraction']:.4f}")
+            print(f"Liquid Fraction: {results['liquid_fraction']:.4f}")
+        
+        print(f"\nCompositions:")
+        print(f"{'Component':<15} {'Overall (z)':<12} {'Liquid (x)':<12} {'Vapor (y)':<12} {'K-value':<10}")
+        print("-" * 65)
+        
+        for i, name in enumerate(results['component_names']):
+            print(f"{name:<15} {results['overall_z'][i]:<12.4f} "
+                  f"{results['liquid_x'][i]:<12.4f} {results['vapor_y'][i]:<12.4f} "
+                  f"{results['K_values'][i]:<10.4f}")
+        
+        print(f"\nConvergence Check:")
+        print(f"  Σx = {results['convergence']['sum_x']:.6f}")
+        print(f"  Σy = {results['convergence']['sum_y']:.6f}")
+        print(f"  Max material balance error: {results['convergence']['material_balance']:.2e}")
+        print(f"  Max equilibrium error: {results['convergence']['equilibrium_error']:.2e}")
+    
+    return all_results
+
+
+def interactive_flash_calculator():
+    """Interactive command-line interface for flash calculations"""
+    
+    print("\n" + "="*60)
+    print("INTERACTIVE VLE FLASH CALCULATOR")
+    print("="*60)
+    
+    # Available components
+    components_db = create_example_mixtures()
+    all_components = {
+        'methanol': components_db['methanol_ethanol'][0],
+        'ethanol': components_db['methanol_ethanol'][1],
+        'water': components_db['methanol_water'][1],
+        'benzene': components_db['benzene_toluene'][0],
+        'toluene': components_db['benzene_toluene'][1]
+    }
+    
+    print("\nAvailable Components:")
+    for name in all_components.keys():
+        print(f"  - {name.capitalize()}")
+    
+    # Get user input
+    n_components = int(input("\nNumber of components (2-5): "))
+    
+    components = []
+    z = []
+    
+    for i in range(n_components):
+        comp_name = input(f"\nComponent {i+1} name: ").lower()
+        if comp_name not in all_components:
+            print(f"Warning: {comp_name} not in database. Using benzene as default.")
+            comp_name = 'benzene'
+        
+        comp = all_components[comp_name]
+        components.append(comp)
+        
+        mole_frac = float(input(f"Mole fraction of {comp_name}: "))
+        z.append(mole_frac)
+    
+    # Normalize mole fractions
+    z = np.array(z) / np.sum(z)
+    
+    T = float(input("\nTemperature (K): "))
+    P = float(input("Pressure (bar): "))
+    
+    # Perform calculation
+    flash = IdealFlashCalculator(components, z, T, P)
+    results = flash.perform_flash()
+    
+    # Display results
+    print("\n" + "="*60)
+    print("FLASH CALCULATION RESULTS")
+    print("="*60)
+    
+    print(f"\nTemperature: {results['temperature_C']:.2f}°C")
+    print(f"Pressure: {results['pressure_bar']:.3f} bar")
+    print(f"Phase Condition: {results['phase_condition']}")
+    
+    if results['phase_condition'] == "Two-Phase":
+        print(f"\nVapor Fraction: {results['vapor_fraction']:.4f}")
+    
+    print(f"\nComponent Compositions:")
+    print(f"{'Component':<12} {'z':<10} {'x':<10} {'y':<10}")
+    print("-" * 45)
+    
+    for i, comp in enumerate(components):
+        print(f"{comp.name:<12} {results['overall_z'][i]:<10.4f} "
+              f"{results['liquid_x'][i]:<10.4f} {results['vapor_y'][i]:<10.4f}")
+    
+    return results
+
+
+def generate_phase_diagram_example():
+    """Generate and plot Txy diagram for a binary mixture"""
+    
+    mixtures = create_example_mixtures()
+    
+    # Analyze benzene-toluene mixture
+    analyzer = BinaryMixtureAnalyzer(
+        mixtures['benzene_toluene'][0],
+        mixtures['benzene_toluene'][1]
+    )
+    
+    print("\nGenerating Txy diagram for Benzene-Toluene at 1 bar...")
+    analyzer.plot_txy_diagram(P=1.0, save_path='txy_diagram_benzene_toluene.png')
+    
+    # Analyze methanol-water mixture (non-ideal behavior)
+    analyzer2 = BinaryMixtureAnalyzer(
+        mixtures['methanol_water'][0],
+        mixtures['methanol_water'][1]
+    )
+    
+    print("\nGenerating Txy diagram for Methanol-Water at 1 bar...")
+    analyzer2.plot_txy_diagram(P=1.0, save_path='txy_diagram_methanol_water.png')
+
+
+if __name__ == "__main__":
+    """
+    Main execution - runs example calculations and provides interactive options
+    """
+    
+    print("\n" + "="*80)
+    print("VLE FLASH CALCULATION PROGRAM")
+    print("="*80)
+    print("\nThis program performs vapor-liquid equilibrium flash calculations")
+    print("using Raoult's law for ideal mixtures.")
+    
+    while True:
+        print("\n" + "-"*40)
+        print("Options:")
+        print("1. Run example calculations")
+        print("2. Interactive flash calculator")
+        print("3. Generate phase diagrams")
+        print("4. Exit")
+        
+        choice = input("\nSelect option (1-4): ")
+        
+        if choice == '1':
+            run_example_calculations()
+        
+        elif choice == '2':
+            try:
+                interactive_flash_calculator()
+            except Exception as e:
+                print(f"\nError: {e}")
+                print("Please check your inputs and try again.")
+        
+        elif choice == '3':
+            try:
+                generate_phase_diagram_example()
+            except Exception as e:
+                print(f"\nError generating phase diagram: {e}")
+        
+        elif choice == '4':
+            print("\nThank you for using the VLE Flash Calculator!")
+            break
+        
+        else:
+            print("\nInvalid option. Please select 1-4.")
+        
+        input("\nPress Enter to continue...")
